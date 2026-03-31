@@ -11,6 +11,7 @@ PORT = 65432
 ARQ_DADOS = "usuarios_leilao.json"
 
 lock = threading.Lock()
+encerrar_servidor = threading.Event()
 
 # clientes conectados: socket -> nome
 clientes = {}
@@ -22,9 +23,9 @@ usuarios = {}
 leiloes = {
     "carro": {
         "item": "carro",
-        "lance_atual": 50000.0,
+        "lance_atual": 4000.0,
         "vencedor": None,
-        "tempo": 30,
+        "tempo": 300,
         "ativo": True
     }
 }
@@ -33,30 +34,37 @@ leiloes = {
 def carregar_dados():
     global usuarios
     if os.path.exists(ARQ_DADOS):
-        with open(ARQ_DADOS, "r", encoding="utf-8") as f:
-            usuarios = json.load(f)
+        try:
+            with open(ARQ_DADOS, "r", encoding="utf-8") as f:
+                usuarios = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            print("[ERRO] Arquivo de dados inválido. Iniciando com base vazia.")
+            usuarios = {}
     else:
         usuarios = {}
 
 
 def salvar_dados():
-    with open(ARQ_DADOS, "w", encoding="utf-8") as f:
-        json.dump(usuarios, f, indent=4, ensure_ascii=False)
+    try:
+        with open(ARQ_DADOS, "w", encoding="utf-8") as f:
+            json.dump(usuarios, f, indent=4, ensure_ascii=False)
+    except OSError as e:
+        print(f"[ERRO] Falha ao salvar dados: {e}")
 
 
 def enviar(sock, tipo, mensagem):
     try:
         sock.sendall(f"[{tipo}] {mensagem}".encode())
-    except:
-        pass
+        return True
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        return False
 
 
 def broadcast(tipo, mensagem):
     mortos = []
     for sock in list(clientes.keys()):
-        try:
-            sock.sendall(f"[{tipo}] {mensagem}".encode())
-        except:
+        ok = enviar(sock, tipo, mensagem)
+        if not ok:
             mortos.append(sock)
 
     for sock in mortos:
@@ -65,13 +73,19 @@ def broadcast(tipo, mensagem):
 
 def remover_cliente(sock):
     with lock:
-        if sock in clientes:
-            nome = clientes[sock]
-            print(f"Cliente desconectado: {nome}")
-            del clientes[sock]
+        nome = clientes.pop(sock, None)
+
+    if nome:
+        print(f"[INFO] Cliente desconectado: {nome}")
+
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
     try:
         sock.close()
-    except:
+    except OSError:
         pass
 
 
@@ -117,7 +131,7 @@ def processar_lance(sock, nome_usuario, item, valor):
 
         try:
             valor = float(valor)
-        except:
+        except ValueError:
             enviar(sock, "ERRO", "Valor de lance inválido.")
             return
 
@@ -132,13 +146,11 @@ def processar_lance(sock, nome_usuario, item, valor):
         vencedor_antigo = dados["vencedor"]
         valor_antigo = dados["lance_atual"]
 
-        # desbloqueia o antigo vencedor
         if vencedor_antigo is not None:
             usuarios[vencedor_antigo]["bloqueado"] -= valor_antigo
             if usuarios[vencedor_antigo]["bloqueado"] < 0:
                 usuarios[vencedor_antigo]["bloqueado"] = 0.0
 
-        # bloqueia o novo
         usuarios[nome_usuario]["bloqueado"] += valor
         dados["lance_atual"] = valor
         dados["vencedor"] = nome_usuario
@@ -169,10 +181,12 @@ def processar_venda(sock, nome_usuario, item):
 
 
 def tratar_comandos(sock, nome_usuario):
-    while True:
+    while not encerrar_servidor.is_set():
         try:
             dados = sock.recv(1024)
+
             if not dados:
+                print(f"[INFO] Conexão encerrada sem :quit por {nome_usuario}.")
                 break
 
             msg = dados.decode().strip()
@@ -188,7 +202,7 @@ def tratar_comandos(sock, nome_usuario):
                 with lock:
                     saldo = usuarios[nome_usuario]["saldo"]
                     bloqueado = usuarios[nome_usuario]["bloqueado"]
-                    itens = usuarios[nome_usuario]["itens"]
+                    itens = usuarios[nome_usuario]["itens"].copy()
 
                 texto_itens = ", ".join(
                     [f"{k}(R${v:.2f})" for k, v in itens.items()]
@@ -223,14 +237,20 @@ def tratar_comandos(sock, nome_usuario):
             else:
                 enviar(sock, "ERRO", "Comando inválido.")
 
-        except:
+        except ConnectionResetError:
+            print(f"[INFO] Cliente {nome_usuario} desconectou abruptamente.")
+            break
+        except OSError:
+            break
+        except Exception as e:
+            print(f"[ERRO] Falha ao tratar comandos de {nome_usuario}: {e}")
             break
 
     remover_cliente(sock)
 
 
 def thread_leiloes():
-    while True:
+    while not encerrar_servidor.is_set():
         time.sleep(1)
 
         encerrados = []
@@ -271,65 +291,100 @@ def thread_leiloes():
                 )
 
 
+def encerrar_todos_clientes():
+    for sock in list(clientes.keys()):
+        enviar(sock, "ALERTA", "Servidor será encerrado.")
+        remover_cliente(sock)
+
+
 def aceitar_clientes(limite_conexoes):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
     server.listen()
+    server.settimeout(1)
 
-    print(f"Servidor ouvindo em {HOST}:{PORT} | limite = {limite_conexoes}")
+    print(f"[INFO] Servidor ouvindo em {HOST}:{PORT} | limite = {limite_conexoes}")
 
-    while True:
-        sock, endereco = server.accept()
-
-        with lock:
-            if len(clientes) >= limite_conexoes:
-                enviar(sock, "ERRO", "Servidor lotado. Tente novamente mais tarde.")
-                sock.close()
+    try:
+        while not encerrar_servidor.is_set():
+            try:
+                sock, endereco = server.accept()
+            except socket.timeout:
                 continue
-
-        try:
-            hora = datetime.now().strftime("%H:%M:%S")
-            enviar(sock, "INFO", f"{hora}: CONECTADO!!")
-            enviar(sock, "INFO", listar_leiloes())
-            enviar(sock, "INFO", "Digite seu nome de usuário:")
-
-            nome = sock.recv(1024).decode().strip()
-
-            if not nome:
-                enviar(sock, "ERRO", "Nome inválido.")
-                sock.close()
-                continue
+            except OSError:
+                if encerrar_servidor.is_set():
+                    break
+                raise
 
             with lock:
-                novo = registrar_ou_carregar_usuario(nome)
-                clientes[sock] = nome
+                if len(clientes) >= limite_conexoes:
+                    enviar(sock, "ERRO", "Servidor lotado. Tente novamente mais tarde.")
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    continue
 
-                saldo = usuarios[nome]["saldo"]
-                itens = usuarios[nome]["itens"]
-
-            if novo:
-                enviar(sock, "INFO", f"Usuário novo '{nome}' criado com 5000 créditos.")
-            else:
-                enviar(sock, "INFO", f"Bem-vindo de volta, {nome}.")
-
-            itens_txt = ", ".join(itens.keys()) if itens else "nenhum"
-            enviar(sock, "INFO", f"Saldo atual: R${saldo:.2f} | Itens: {itens_txt}")
-
-            t = threading.Thread(target=tratar_comandos, args=(sock, nome), daemon=True)
-            t.start()
-
-        except:
             try:
-                sock.close()
-            except:
-                pass
+                hora = datetime.now().strftime("%H:%M:%S")
+                enviar(sock, "INFO", f"{hora}: CONECTADO!!")
+                enviar(sock, "INFO", listar_leiloes())
+                enviar(sock, "INFO", "Digite seu nome de usuário:")
+
+                sock.settimeout(20)
+                nome = sock.recv(1024).decode().strip()
+                sock.settimeout(None)
+
+                if not nome:
+                    enviar(sock, "ERRO", "Nome inválido.")
+                    sock.close()
+                    continue
+
+                with lock:
+                    novo = registrar_ou_carregar_usuario(nome)
+                    clientes[sock] = nome
+                    saldo = usuarios[nome]["saldo"]
+                    itens = usuarios[nome]["itens"].copy()
+
+                print(f"[INFO] Cliente conectado: {nome} ({endereco[0]}:{endereco[1]})")
+
+                if novo:
+                    enviar(sock, "INFO", f"Usuário novo '{nome}' criado com 5000 créditos.")
+                else:
+                    enviar(sock, "INFO", f"Bem-vindo de volta, {nome}.")
+
+                itens_txt = ", ".join(itens.keys()) if itens else "nenhum"
+                enviar(sock, "INFO", f"Saldo atual: R${saldo:.2f} | Itens: {itens_txt}")
+
+                t = threading.Thread(target=tratar_comandos, args=(sock, nome), daemon=True)
+                t.start()
+
+            except socket.timeout:
+                enviar(sock, "ERRO", "Tempo esgotado para informar o nome de usuário.")
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            except Exception as e:
+                print(f"[ERRO] Falha ao aceitar cliente: {e}")
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    finally:
+        salvar_dados()
+        try:
+            server.close()
+        except OSError:
+            pass
 
 
 def main():
     carregar_dados()
 
     if len(sys.argv) != 2:
-        print("Use: py servidor.py <limite_conexoes>")
+        print("Uso: py servidor.py <limite_conexoes>")
         return
 
     try:
@@ -342,7 +397,16 @@ def main():
         return
 
     threading.Thread(target=thread_leiloes, daemon=True).start()
-    aceitar_clientes(limite)
+
+    try:
+        aceitar_clientes(limite)
+    except KeyboardInterrupt:
+        print("\n[INFO] Encerrando servidor com segurança...")
+    finally:
+        encerrar_servidor.set()
+        salvar_dados()
+        encerrar_todos_clientes()
+        print("[INFO] Dados salvos. Servidor encerrado.")
 
 
 if __name__ == "__main__":
